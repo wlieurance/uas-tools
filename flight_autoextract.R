@@ -58,14 +58,23 @@ remove_dup_photos <-  function(files){
 #'
 #' @return sf POINTZ containing identified flight groupings of points.
 #' @export
-populate_space_time <- function(dat, break_minutes,
-                                crs = 4326, tz = "America/Los_Angeles"){
-  df <- st_as_sf(dat, coords=c("GPSLongitude", "GPSLatitude", "GPSAltitude"), 
-                 crs = crs, agr = "constant", remove = FALSE) %>%
+populate_space_time <- function(dat, break_minutes = NULL,
+                                crs = 4326, tz = "UTC", tz_new = NULL){
+  df <- dat %>%
     mutate(dt = as_datetime(DateTimeOriginal, tz = tz)) %>%
-    rename(x = GPSLongitude, y = GPSLatitude, z = GPSAltitude)
+    rename(x = GPSLongitude, y = GPSLatitude, z = GPSAltitude) %>%
+    filter(!is.na(x) & !is.na(y) & !is.na(z)) %>%
+    st_as_sf(coords=c("x", "y", "z"), 
+             crs = crs, agr = "constant", remove = FALSE)
+
+  if (!is.null(tz_new)){
+    df <- df %>%
+      mutate(dt_orig = dt) %>%
+      mutate(dt = lubridate::with_tz(dt, tz_new))
+  }
   
-  df.p <- df %>% filter(x != 0 & y != 0 & z != 0) %>%
+  df.p <- df %>% 
+    filter(x != 0 & y != 0 & z != 0) %>%
     group_by(SerialNumber) %>%
     mutate(prev_dt = lag(dt, order_by = dt)) %>%
     mutate(prev_delta = dt - prev_dt, grp = NA) %>% ungroup() %>%
@@ -73,18 +82,23 @@ populate_space_time <- function(dat, break_minutes,
   
   # iterates through rows, assigning a new group if it finds a new serial #
   # or a time break > time_break
-  g <-  1
-  df.p[1, "grp"] <-  g
-  for (row in 2:nrow(df.p)){
-    delta <- df.p[[row, "prev_delta"]]
-    prev.id <- df.p[[row - 1, "SerialNumber"]]
-    id <- prev.id <- df.p[[row, "SerialNumber"]]
-    if (id != prev.id | is.na(delta)){
-      g <- 1
-    } else if (delta > minutes(break_minutes) & id == prev.id){
-      g <- g + 1
+  if (!is.null(break_minutes)){
+    g <-  1
+    df.p[1, "grp"] <-  g
+    for (row in 2:nrow(df.p)){
+      delta <- df.p[[row, "prev_delta"]]
+      prev.id <- df.p[[row - 1, "SerialNumber"]]
+      id <- prev.id <- df.p[[row, "SerialNumber"]]
+      if (id != prev.id | is.na(delta)){
+        g <- 1
+      } else if (delta > minutes(break_minutes) & id == prev.id){
+        g <- g + 1
+      }
+      df.p[row, "grp"] <- g
     }
-    df.p[row, "grp"] <- g
+  } else {
+    df.p <- df.p %>%
+      mutate(grp = 1)
   }
   return(df.p)
 }
@@ -147,11 +161,19 @@ join_id_point <- function(lines, df){
 #'
 #' @return A tibble with selected metadata and (optionally) md5 hashes.
 #' @export
-import <-  function(path, rm, rec, raw){
+import <-  function(path, rm = F, rec = F, raw = NULL, 
+                    pattern = "(?i)\\.(?:JPE?G)|(?:TIFF?)"){
   if (dir.exists(path)){
-    files <- list.files(path = path, pattern = "*.JPG", 
+    files <- list.files(path = path, pattern = pattern, 
                         recursive = rec, full.names= TRUE)
-    
+    if (length(files) > 0){
+      cat(paste0(length(files), " files found.\n"))
+    } else {
+      cat(paste0("Could not find any files with regex pattern: ", 
+                 pattern, "\n"))
+      cat("Quitting...\n")
+      quit()
+    }
     # detect and remove duplicates
     if (rm == TRUE){
       print("Removing duplicate photos...")
@@ -176,7 +198,7 @@ import <-  function(path, rm, rec, raw){
     }
   } else if (file.exists(path)){
     print("Reading csv...")
-    dat <- read_csv(path, show_col_types = FALSE, quiet = TRUE)
+    dat <- read_csv(path, show_col_types = FALSE)
   } else {
     print("scan_path is neither a directory or a file. Quitting...")
     quit()
@@ -204,13 +226,13 @@ import <-  function(path, rm, rec, raw){
 write_geo <- function(path, line_feat, point_feat){
   if (dir.exists(path)){
     suppressWarnings(
-      st_write(line_feat, path, layer = "lines", 
+    st_write(line_feat, path, layer = "lines", 
              delete_layer = TRUE, driver = "ESRI Shapefile", 
-             layer_options = "SHPT=ARCZ", quiet = TRUE))
+             layer_options = "SHPT=ARCZ", quiet = TRUE, delete_dsn = TRUE))
     suppressWarnings(
     st_write(point_feat, path, layer = "points", 
              delete_layer = TRUE, driver = "ESRI Shapefile", 
-             layer_options = "SHPT=POINTZ", quiet = TRUE))
+             layer_options = "SHPT=POINTZ", quiet = TRUE, delete_dsn = TRUE))
   } else {
     suppressWarnings(
     st_write(line_feat, path, layer = "lines", delete_layer = TRUE, 
@@ -250,7 +272,13 @@ create_copy_scripts <- function(path, copy, df, lines){
     writeLines("#!/usr/bin/env bash", fcon)
     for (j in rownames(new.df)){
       # print(text)
-      text <-  paste0("cp ", new.df[j,]$SourceFile, " ", copy, "/")
+      ts <- format(new.df[j,]$dt, format="%Y%m%d_%H%M%S")
+      source <- new.df[j,]$SourceFile
+      base <- basename(source)
+      ext <- file_ext(base)
+      name <- file_path_sans_ext(base)
+      base_new <- paste0(ts, "_", name, ".", ext) 
+      text <-  paste0("cp ", new.df[j,]$SourceFile, " ", copy, "/", base_new)
       writeLines(text, fcon)
     }
     close(fcon)
@@ -270,6 +298,9 @@ plot_flights <- function(lines, out){
   # names(bbox) <- c("left", "bottom", "right", "top")
   # center <- c(long = mean(bbox[1],bbox[3]), lat = mean(bbox[2],bbox[4]))
   # base <- get_tiles(lines, crop = TRUE, zoom = 17, provider = "OpenTopoMap")
+  if (dir.exists(out)){
+    out <- file.path(out, "plot.png")
+  }
   plt <- ggplot() + 
     geom_sf(data = lines, aes(color = flight_no)) +
     scale_color_viridis_c() +
@@ -308,14 +339,16 @@ plot_flights <- function(lines, out){
 #'
 #' @return None.
 #' @export
-main <- function(scan_path, geo_path, time_break = 5, min_pts = 3, 
+main <- function(scan_path, geo_path, time_break = NULL, min_pts = 3, 
                  rm_dups = FALSE, recursive = TRUE, script_dir = NULL, 
-                 copy_dir = NULL, raw_meta_path = NULL, plot = NULL){
+                 copy_dir = NULL, raw_meta_path = NULL, plot = NULL, 
+                 tz = "UTC", tz_new = NULL){
   print("Reading data...")
-  df <- import(path = scan_path, rm = rm_dups, rec = recursive, 
-               raw = raw_meta_path)
+  dat <- import(path = scan_path, rm = rm_dups, rec = recursive, 
+                raw = raw_meta_path)
   print("Populating space and time attributes...")  
-  df.s <- populate_space_time(dat = df, break_minutes = time_break)
+  df.s <- populate_space_time(dat = dat, break_minutes = time_break, tz = tz,
+                              tz_new = tz_new)
   feat.list <- points_to_lines(df = df.s)
   df.j <- join_id_point(lines = feat.list$line, df = df.s)
   print("Writing spatial features...")
@@ -334,13 +367,15 @@ main <- function(scan_path, geo_path, time_break = 5, min_pts = 3,
 
 # runs if called from Rscript on command line
 if (sys.nframe() == 0){
+  args = commandArgs(trailingOnly = TRUE)
+  
   parser <- OptionParser(formatter = IndentedHelpFormatter,
                          usage = "usage: %prog [options] scan_path out_path",
                          description = "Searches 'scan_path' for JPEG files and
                          constructs flight features based on date, time, and 
                          camera serial number, and outputs spatial features to
                          out_path (directory for shapefiles).")
-  parser <- add_option(parser, c("-b", "--time_break"), type = "double",
+  parser <- add_option(parser, c("-b", "--time_break"), type = "double", 
                        help = "number of minutes that must occur between photos 
                        in order to break them up into separate flights.")
   parser <- add_option(parser, c("-n", "--min_point_no"), type = "integer",
@@ -358,42 +393,51 @@ if (sys.nframe() == 0){
   parser <- add_option(parser, c("-l", "--script_copy_dir"), 
                        help = "The directory to which scripts will copy photos.")
   parser <- add_option(parser, c("-m", "--raw_meta_path"), 
-                       help = "The file path to write the raw photo metadata 
+                       help = "The (.csv) file path to write the raw photo metadata 
                        before processing. This file can be passed to 'scan_path'
                        as an alternative to scanning a directory for photos.")
   parser <- add_option(parser, c("-p", "--plot_path"), 
                        help = "path to save a plot of the flights")
+  parser <- add_option(parser, c("-t", "--tz"), default = "UTC",
+                       help = paste0("Time zone of the date time data captured",
+                                     " in the EXIF metadata (See R ",
+                                     "OlsonNames() function for valid options."))
+  parser <- add_option(parser, c("-T", "--tz_new"),
+                       help = paste0("Timezone used in writing new filenames ",
+                                     "for copying. See R OlsonNames() function",
+                                     " for valid options."))
   
-  my.args = commandArgs(trailingOnly = TRUE)
-  args <- parse_args(object = parser, my.args, positional_arguments = 2)
+  opt <- parse_args(object = parser, args = args, positional_arguments = 2)
   
   # checking argument sanity
-  if (!dir.exists(args$args[1]) & !file.exists(args$args[1])){
-    print(args$args[1], "does not exist. Quitting...")
+  if (!dir.exists(opt$args[1]) & !file.exists(opt$args[1])){
+    print(opt$args[1], "does not exist. Quitting...")
     quit()
   }
-  if (!is.null(args$options$script_dir)){
-    if (!dir.exists(args$options$script_dir)){
-      print(args$options$script_dir, "directory does not exist. Quitting...")
+  if (!is.null(opt$options$script_dir)){
+    if (!dir.exists(opt$options$script_dir)){
+      print(opt$options$script_dir, "directory does not exist. Quitting...")
       quit()
     }
   }
-  if (!is.null(args$options$raw_meta_path)){
-    if (args$options$raw_meta_path == args$args[1]){
+  if (!is.null(opt$options$raw_meta_path)){
+    if (opt$options$raw_meta_path == opt$args[1]){
       print("raw_meta_path and scan_path cannot be the same. Quitting..." )
       quit()
     }
   }
 
-  main(scan_path = args$args[1], 
-       geo_path = args$args[2], 
-       time_break = args$options$time_break,
-       min_pts = args$options$min_point_no,
-       rm_dups = args$options$rm_dups, 
-       recursive = args$options$recursive,
-       script_dir = args$options$script_dir, 
-       copy_dir = args$options$script_copy_dir,
-       raw_meta_path = args$options$raw_meta_path,
-       plot = args$options$plot_path)
+  main(scan_path = opt$args[1], 
+       geo_path = opt$args[2], 
+       time_break = opt$options$time_break,
+       min_pts = opt$options$min_point_no,
+       rm_dups = opt$options$rm_dups, 
+       recursive = opt$options$recursive,
+       script_dir = opt$options$script_dir, 
+       copy_dir = opt$options$script_copy_dir,
+       raw_meta_path = opt$options$raw_meta_path,
+       plot = opt$options$plot_path,
+       tz = opt$options$tz,
+       tz_new = opt$options$tz_new)
 }
 
